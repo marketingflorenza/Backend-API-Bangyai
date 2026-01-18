@@ -10,40 +10,29 @@ export default async function handler(req, res) {
   }
 
   try {
-    // 2. ดึงค่า Environment Variables (รองรับทั้งชื่อเก่าและใหม่)
+    // 2. ดึงค่า Environment Variables
     const accessToken = process.env.FACEBOOK_ACCESS_TOKEN || process.env.FB_ACCESS_TOKEN;
     let adAccountId = process.env.AD_ACCOUNT_ID;
 
-    // ตรวจสอบว่ามีค่าหรือไม่
     if (!accessToken || !adAccountId) {
       return res.status(500).json({ 
-        error: 'Missing environment variables (FACEBOOK_ACCESS_TOKEN or AD_ACCOUNT_ID)',
+        error: 'Missing environment variables',
         success: false
       });
     }
 
-    // แก้ไข Format ของ Ad Account ID ให้มี 'act_' นำหน้าเสมอ
     if (!adAccountId.startsWith('act_')) {
       adAccountId = `act_${adAccountId}`;
     }
 
-    // ---------------------------------------------------------
-    // ส่วน Helper Functions
-    // ---------------------------------------------------------
-    
-    // แปลงวันที่จาก DD-MM-YYYY เป็น YYYY-MM-DD
+    // Helper Functions
     function convertDateFormat(dateStr) {
       if (!dateStr) return null;
       const parts = dateStr.split('-');
       if (parts.length !== 3) return null;
-      const day = parts[0].padStart(2, '0');
-      const month = parts[1].padStart(2, '0');
-      const year = parts[2];
-      if (isNaN(day) || isNaN(month) || isNaN(year)) return null;
-      return `${year}-${month}-${day}`;
+      return `${parts[2]}-${parts[1]}-${parts[0]}`;
     }
 
-    // แปลงวันที่จาก YYYY-MM-DD กลับเป็น DD-MM-YYYY
     function formatDateForResponse(dateStr) {
       if (!dateStr) return null;
       const parts = dateStr.split('-');
@@ -59,18 +48,15 @@ export default async function handler(req, res) {
     }
 
     // ---------------------------------------------------------
-    // 3. เริ่มต้นกระบวนการดึงข้อมูล
+    // 3. เริ่มต้น Timezone และ Date Logic
     // ---------------------------------------------------------
-
-    // 3.1 ดึง Timezone ของ Ad Account
     let adAccountTimezone = null;
-    let timezoneOffset = 0; // Default UTC
+    let timezoneOffset = 0;
 
     try {
       const accountResponse = await fetch(
         `https://graph.facebook.com/v19.0/${adAccountId}?access_token=${accessToken}&fields=timezone_id,timezone_name,timezone_offset_hours_utc`
       );
-      
       if (accountResponse.ok) {
         const accountData = await accountResponse.json();
         if (!accountData.error) {
@@ -79,13 +65,11 @@ export default async function handler(req, res) {
         }
       }
     } catch (error) {
-      console.error('Error fetching ad account timezone:', error);
+      console.error('Error fetching timezone:', error);
     }
 
-    // 3.2 คำนวณวันและเวลา (Time Range Logic)
     const { since, until } = req.query;
     const now = new Date();
-    // ปรับเวลาให้ตรงกับ Ad Account Timezone
     const accountNow = new Date(now.getTime() + (timezoneOffset * 60 * 60 * 1000));
     const today = new Date(accountNow.getUTCFullYear(), accountNow.getUTCMonth(), accountNow.getUTCDate());
     const thirtyDaysAgo = new Date(today.getTime() - (30 * 24 * 60 * 60 * 1000));
@@ -96,7 +80,7 @@ export default async function handler(req, res) {
 
     if (since) {
       dateStart = convertDateFormat(since);
-      if (!dateStart) return res.status(400).json({ success: false, error: 'Invalid since date (DD-MM-YYYY)' });
+      if (!dateStart) return res.status(400).json({ success: false, error: 'Invalid since date' });
     } else {
       dateStart = getUTCDateString(thirtyDaysAgo);
       originalSince = formatDateForResponse(dateStart);
@@ -104,46 +88,38 @@ export default async function handler(req, res) {
 
     if (until) {
       dateStop = convertDateFormat(until);
-      if (!dateStop) return res.status(400).json({ success: false, error: 'Invalid until date (DD-MM-YYYY)' });
+      if (!dateStop) return res.status(400).json({ success: false, error: 'Invalid until date' });
     } else {
       dateStop = getUTCDateString(today);
       originalUntil = formatDateForResponse(dateStop);
     }
 
     // ---------------------------------------------------------
-    // 4. ดึงข้อมูล Campaigns (จุดสำคัญที่แก้ไข)
+    // 4. ดึง Campaigns (แก้ไข: ปลดล็อก Filter ออกทั้งหมด)
     // ---------------------------------------------------------
     
-    // เพิ่ม filtering เอาเฉพาะ ACTIVE และ PAUSED เพื่อไม่ให้ติด Campaign เก่าๆ ที่ปิดไปแล้ว
-    // เพิ่ม limit เป็น 100
-    const campaignsUrl = `https://graph.facebook.com/v19.0/${adAccountId}/campaigns?access_token=${accessToken}&fields=id,name,status,objective,created_time,updated_time,effective_status&limit=100&filtering=[{"field":"effective_status","operator":"IN","value":["ACTIVE","PAUSED"]}]`;
+    // เอา filtering ออก เพื่อให้เห็น Campaign เก่าๆ ที่จบไปแล้ว หรือ Archive ไปแล้วด้วย
+    // เพิ่ม limit เป็น 200 เพื่อให้แน่ใจว่าดึงมาครบ
+    const campaignsUrl = `https://graph.facebook.com/v19.0/${adAccountId}/campaigns?access_token=${accessToken}&fields=id,name,status,objective,created_time,updated_time,effective_status&limit=200`;
 
     const campaignsResponse = await fetch(campaignsUrl);
-
-    if (!campaignsResponse.ok) {
-      const errorText = await campaignsResponse.text();
-      throw new Error(`Facebook API campaigns error: ${campaignsResponse.status} - ${errorText}`);
-    }
-
+    if (!campaignsResponse.ok) throw new Error('Failed to fetch campaigns');
+    
     const campaignsData = await campaignsResponse.json();
-    if (campaignsData.error) {
-      throw new Error(`Facebook API Error: ${campaignsData.error.message}`);
-    }
+    if (campaignsData.error) throw new Error(campaignsData.error.message);
 
     const campaigns = campaignsData.data || [];
     const isLast30Days = dateStart === getUTCDateString(thirtyDaysAgo) && dateStop === getUTCDateString(today);
 
     // ---------------------------------------------------------
-    // 5. ดึง Insights และ Ads ของแต่ละ Campaign
+    // 5. ดึง Insights & Ads Details
     // ---------------------------------------------------------
 
     const campaignsWithDetails = await Promise.all(
       campaigns.map(async (campaign, index) => {
         try {
-          // Delay เล็กน้อยเพื่อกัน Rate Limit
-          if (index > 0) await new Promise(resolve => setTimeout(resolve, 50));
+          if (index > 0) await new Promise(r => setTimeout(r, 50));
 
-          // สร้าง URL สำหรับ Insights
           let insightsUrl;
           const fields = 'spend,impressions,clicks,reach,ctr,cpc,cpm,frequency,actions,cost_per_action_type';
           
@@ -154,7 +130,6 @@ export default async function handler(req, res) {
             insightsUrl = `https://graph.facebook.com/v19.0/${campaign.id}/insights?access_token=${accessToken}&fields=${fields}&time_range=${timeRange}&level=campaign`;
           }
 
-          // ดึง Insights
           const insightsResponse = await fetch(insightsUrl);
           let insights = null;
           if (insightsResponse.ok) {
@@ -162,60 +137,63 @@ export default async function handler(req, res) {
             insights = data.data?.[0] || null;
           }
 
-          // ดึง Ads และรูปภาพ (Limit 10 ads per campaign)
+          // ถ้าไม่มี Insights (เช่น แคมเปญสร้างไว้แต่ไม่ได้ยิงโฆษณาในช่วงเวลานี้) ให้ข้ามส่วน Ads ไปเลยเพื่อประหยัดเวลา
+          // หรือถ้าต้องการแสดงชื่อแคมเปญแม้ Spend = 0 ก็ให้รันต่อ
+          // ในที่นี้เลือกที่จะดึง Ads ต่อ เพื่อให้เห็นว่ามีแคมเปญอยู่จริง
+
+          // Fetch Ads (Limit 5)
           const adsResponse = await fetch(
-            `https://graph.facebook.com/v19.0/${campaign.id}/ads?access_token=${accessToken}&fields=id,name,status&limit=10`
+            `https://graph.facebook.com/v19.0/${campaign.id}/ads?access_token=${accessToken}&fields=id,name,status&limit=5`
           );
-          
           let ads = [];
           if (adsResponse.ok) {
             const adsData = await adsResponse.json();
             ads = adsData.data || [];
           }
 
-          // ดึงรูปภาพ Creative (Limit 3 images per campaign to save bandwidth/quota)
+          // Fetch Images (Limit 2)
           const adsWithImages = await Promise.all(
-            ads.slice(0, 3).map(async (ad, i) => {
-              if (i > 0) await new Promise(r => setTimeout(r, 20));
-              try {
-                const creativeRes = await fetch(
-                  `https://graph.facebook.com/v19.0/${ad.id}/adcreatives?access_token=${accessToken}&fields=image_url,thumbnail_url,object_story_spec`
-                );
-                let images = [];
-                if (creativeRes.ok) {
-                  const creativeData = await creativeRes.json();
-                  (creativeData.data || []).forEach(c => {
-                    if (c.image_url) images.push({ type: 'image', url: c.image_url });
-                    else if (c.object_story_spec?.link_data?.picture) {
-                      images.push({ type: 'link_image', url: c.object_story_spec.link_data.picture });
-                    }
-                  });
-                }
-                return { ...ad, images };
-              } catch (e) {
-                return { ...ad, images: [] };
-              }
-            })
+             ads.slice(0, 2).map(async (ad) => {
+               try {
+                 const creativeRes = await fetch(
+                   `https://graph.facebook.com/v19.0/${ad.id}/adcreatives?access_token=${accessToken}&fields=image_url,thumbnail_url,object_story_spec`
+                 );
+                 let images = [];
+                 if (creativeRes.ok) {
+                   const cData = await creativeRes.json();
+                   (cData.data || []).forEach(c => {
+                     if (c.image_url) images.push({ type: 'image', url: c.image_url });
+                     else if (c.object_story_spec?.link_data?.picture) images.push({ type: 'link_image', url: c.object_story_spec.link_data.picture });
+                   });
+                 }
+                 return { ...ad, images };
+               } catch (e) { return { ...ad, images: [] }; }
+             })
           );
 
-          return {
-            ...campaign,
-            insights,
-            ads: adsWithImages
-          };
-
-        } catch (error) {
-          console.error(`Error processing campaign ${campaign.id}:`, error);
-          return { ...campaign, error: error.message };
+          return { ...campaign, insights, ads: adsWithImages };
+        } catch (e) {
+          return { ...campaign, error: e.message, ads: [] };
         }
       })
     );
 
     // ---------------------------------------------------------
-    // 6. คำนวณ Totals และส่งค่ากลับ
+    // 6. กรองแคมเปญที่มีข้อมูล (Optional: ถ้าอยากแสดงเฉพาะที่มี Spend)
+    // ---------------------------------------------------------
+    
+    // ถ้าอยากให้แสดง *ทุกแคมเปญ* (แม้ Spend = 0) ให้ใช้บรรทัดนี้:
+    const finalCampaigns = campaignsWithDetails;
+    
+    // แต่ถ้าอยากให้แสดง *เฉพาะแคมเปญที่มี Spend ในช่วงเวลานั้น* ให้เปิดบรรทัดล่างนี้แทน:
+    // const finalCampaigns = campaignsWithDetails.filter(c => c.insights && parseFloat(c.insights.spend) > 0);
+
+
+    // ---------------------------------------------------------
+    // 7. คำนวณ Totals และ FORMAT DATA
     // ---------------------------------------------------------
 
-    const totals = campaignsWithDetails.reduce((acc, campaign) => {
+    const totals = finalCampaigns.reduce((acc, campaign) => {
       if (campaign.insights) {
         acc.spend += parseFloat(campaign.insights.spend || 0);
         acc.impressions += parseInt(campaign.insights.impressions || 0);
@@ -241,16 +219,33 @@ export default async function handler(req, res) {
         cpc: totals.clicks ? parseFloat((totals.spend / totals.clicks).toFixed(2)) : 0
       },
       data: {
-        campaigns: campaignsWithDetails
+        campaigns: finalCampaigns.map(campaign => ({
+          ...campaign,
+          insights: campaign.insights ? {
+            ...campaign.insights,
+            spend: parseFloat(campaign.insights.spend || 0),
+            impressions: parseInt(campaign.insights.impressions || 0),
+            clicks: parseInt(campaign.insights.clicks || 0),
+            reach: parseInt(campaign.insights.reach || 0),
+            ctr: parseFloat(campaign.insights.ctr || 0),
+            cpc: parseFloat(campaign.insights.cpc || 0),
+            cpm: parseFloat(campaign.insights.cpm || 0)
+          } : {
+            // กรณีไม่มี Insights ให้ส่งค่า 0 ไปแทน null เพื่อไม่ให้ Frontend Error
+            spend: 0,
+            impressions: 0,
+            clicks: 0,
+            reach: 0,
+            ctr: 0,
+            cpc: 0,
+            cpm: 0
+          }
+        }))
       }
     });
 
   } catch (error) {
     console.error('API Critical Error:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message,
-      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
-    });
+    res.status(500).json({ success: false, error: error.message });
   }
 }
